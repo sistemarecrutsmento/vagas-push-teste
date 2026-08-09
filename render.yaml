@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vagasio-push-test-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: VAPID_SUBJECT
+        value: mailto:teste@vagasio.com.br
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
