@@ -43,7 +43,7 @@ wss.on('connection',socket=>{
   }
   if(!joined||!item)return;
   if(msg.type==='end-call'){
-   if(role!=='recrutador')return reject(socket,'unauthorized','recruiter-only-end-call');
+   if(role!=='recrutador'){send(socket,{type:'unauthorized',reason:'recruiter-only-end-call'});return;}
    if(item.ended)return;
    item.ended=true;broadcast(item,{type:'call-ended',by:'recrutador'});send(socket,{type:'call-ended',by:'recrutador'});
    for(const p of item.peers.values())try{p.close(1000,'call-ended')}catch(_){ }
