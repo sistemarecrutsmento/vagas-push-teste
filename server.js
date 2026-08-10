@@ -1,9 +1,11 @@
-const express=require('express');const cors=require('cors');const webpush=require('web-push');
+const express=require('express');const cors=require('cors');const webpush=require('web-push');const WebSocket=require('ws');
 const app=express();app.use(cors());app.use(express.json({limit:'32kb'}));
 const subs=new Map();
 if(process.env.VAPID_PUBLIC_KEY&&process.env.VAPID_PRIVATE_KEY)webpush.setVapidDetails(process.env.VAPID_SUBJECT||'mailto:teste@vagasio.com.br',process.env.VAPID_PUBLIC_KEY,process.env.VAPID_PRIVATE_KEY);
-app.get('/health',(req,res)=>res.json({ok:true,assinaturas:subs.size}));
+app.get('/health',(req,res)=>res.json({ok:true,assinaturas:subs.size,video:true}));
 app.get('/public-key',(req,res)=>res.json({publicKey:process.env.VAPID_PUBLIC_KEY||null}));
 app.post('/subscribe',(req,res)=>{const s=req.body;if(!s?.endpoint||!s?.keys?.p256dh||!s?.keys?.auth)return res.status(400).json({erro:'Assinatura inválida'});subs.set(s.endpoint,s);res.json({ok:true});});
 app.post('/send-test',async(req,res)=>{if(!process.env.VAPID_PUBLIC_KEY||!process.env.VAPID_PRIVATE_KEY)return res.status(503).json({erro:'VAPID não configurado'});const payload=JSON.stringify({title:'VagasIO — teste real',body:'Notificação enviada pelo backend de teste.'});let enviados=0;for(const [endpoint,s] of subs){try{await webpush.sendNotification(s,payload);enviados++}catch(e){if(e.statusCode===404||e.statusCode===410)subs.delete(endpoint);}}res.json({ok:true,enviados});});
-app.listen(process.env.PORT||3000,()=>console.log('push test api online'));
+const server=app.listen(process.env.PORT||3000,()=>console.log('push/video test online'));
+const wss=new WebSocket.Server({server});const rooms=new Map();
+wss.on('connection',socket=>{let room;socket.on('message',raw=>{let msg;try{msg=JSON.parse(raw)}catch(_){return}if(msg.type==='join'&&msg.room){room=String(msg.room).slice(0,80);const peers=rooms.get(room)||[];if(peers.length>=2)return socket.send(JSON.stringify({type:'full'}));peers.push(socket);rooms.set(room,peers);if(peers.length===2)peers.forEach(p=>p.readyState===1&&p.send(JSON.stringify({type:'ready'})));return}if(!room)return;for(const peer of rooms.get(room)||[])if(peer!==socket&&peer.readyState===1)peer.send(JSON.stringify(msg))});socket.on('close',()=>{if(!room)return;const peers=(rooms.get(room)||[]).filter(p=>p!==socket);if(peers.length)rooms.set(room,peers);else rooms.delete(room)})});
