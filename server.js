@@ -1,22 +1,56 @@
-'use strict';
-const http=require('http'), express=require('express'), WebSocket=require('ws'), crypto=require('crypto');
-const app=express(), PORT=Number(process.env.PORT||3000), SECRET=process.env.VIDEO_TEST_TOKEN_SECRET;
-if(!SECRET) throw new Error('VIDEO_TEST_TOKEN_SECRET is required');
-const TTL=Math.min(900,Math.max(60,Number(process.env.VIDEO_TEST_TOKEN_TTL||900)));
-const ORIGINS=new Set((process.env.VIDEO_TEST_ALLOWED_ORIGINS||'https://sistemarecrutsmento.github.io').split(',').map(x=>x.trim()).filter(Boolean));
-const PAGE=process.env.VIDEO_TEST_PAGE_URL||'https://sistemarecrutsmento.github.io/vagas-push-teste/video.html';
-const rooms=new Map(), issued=new Map(), limits=new WeakMap();
-app.use((req,res,next)=>{res.set('X-Content-Type-Options','nosniff');res.set('Cache-Control','no-store');const o=req.get('origin');if(o&&ORIGINS.has(o))res.set('Access-Control-Allow-Origin',o);if(req.method==='OPTIONS'){if(o&&!ORIGINS.has(o))return res.sendStatus(403);res.set('Access-Control-Allow-Headers','content-type');res.set('Access-Control-Allow-Methods','POST,OPTIONS');return res.sendStatus(204)}next()});
-app.use(express.json({limit:'8kb'}));
-const enc=o=>Buffer.from(JSON.stringify(o)).toString('base64url');
-function token(room,role){const p={v:1,jti:crypto.randomBytes(18).toString('hex'),room,role,exp:Math.floor(Date.now()/1000)+TTL};const b=enc(p);issued.set(p.jti,{exp:p.exp,used:false});return b+'.'+crypto.createHmac('sha256',SECRET).update(b).digest('base64url')}
-function verify(t){if(typeof t!=='string'||t.length>2048)throw Error('invalid_token');const [b,s]=t.split('.');const sig=crypto.createHmac('sha256',SECRET).update(b||'').digest('base64url');if(!s||s.length!==sig.length||!crypto.timingSafeEqual(Buffer.from(s),Buffer.from(sig)))throw Error('invalid_token');const p=JSON.parse(Buffer.from(b,'base64url'));if(!p.jti||!p.room||!p.role||p.exp<=Date.now()/1000)throw Error('expired_token');return p}
-function clean(){const now=Date.now()/1000;for(const [j,v] of issued)if(v.exp<now)issued.delete(j);for(const [r,v] of rooms)if(v.exp<now){for(const s of v.peers)if(s.readyState===1){s.send(JSON.stringify({type:'expired'}));s.close(4001,'expired')}rooms.delete(r)}}setInterval(clean,30000).unref();
-function err(res,status,code){return res.status(status).json({ok:false,error:code})}
-app.get('/health',(q,r)=>r.json({ok:true,isolated:true,video:true,ttlSeconds:TTL}));
-app.post('/create-room',(q,r)=>{const o=q.get('origin');if(o&&!ORIGINS.has(o))return err(r,403,'origin_denied');const b=q.body||{};const vaga=String(b.vaga||'').trim().slice(0,120);if(!vaga)return err(r,400,'vaga_required');const room='entrevista-'+crypto.randomBytes(12).toString('hex'),exp=Date.now()+TTL*1000;const rc=token(room,'recrutador'),cc=token(room,'candidato');rooms.set(room,{exp,peers:[]});const u=(t,role,n)=>`${PAGE}?room=${encodeURIComponent(room)}&token=${encodeURIComponent(t)}&role=${role}&nome=${encodeURIComponent(String(n||'Participante').trim().slice(0,80))}`;r.status(201).json({ok:true,room,ttlSeconds:TTL,expiresAt:new Date(exp).toISOString(),recrutador_url:u(rc,'recrutador',b.recrutador||'Recrutador'),candidato_url:u(cc,'candidato',b.candidato||'Candidato')})});
-function valid(m){if(!m||typeof m!=='object'||!['join','offer','answer','candidate','chat'].includes(m.type))return false;if(m.type==='join')return [m.room,m.token,m.role].every(x=>typeof x==='string'&&x.length>0&&x.length<2048);if(m.type==='chat')return typeof m.text==='string'&&m.text.length<=2000;if(m.type==='candidate')return m.candidate&&typeof m.candidate==='object';return m[m.type]&&typeof m[m.type]==='object'}
-function deny(ws,code){if(ws.readyState===1)ws.send(JSON.stringify({type:'error',code}));ws.close(4003,code)}
-const server=http.createServer(app),wss=new WebSocket.Server({server,maxPayload:65536,verifyClient:({origin},done)=>done(!origin||ORIGINS.has(origin),403,'origin_denied')});
-wss.on('connection',ws=>{let st=null;limits.set(ws,{at:Date.now(),n:0});ws.on('message',(raw,bin)=>{if(bin||raw.length>65536)return deny(ws,'message_too_large');const l=limits.get(ws),now=Date.now();if(now-l.at>1000){l.at=now;l.n=0}if(++l.n>40)return deny(ws,'rate_limited');let m;try{m=JSON.parse(raw.toString())}catch{return deny(ws,'invalid_json')}if(!valid(m))return deny(ws,'invalid_message');if(m.type==='join'){if(st)return deny(ws,'already_joined');let p;try{p=verify(m.token)}catch(e){return deny(ws,e.message)}if(p.room!==m.room||p.role!==m.role)return deny(ws,'room_or_role_mismatch');const rec=issued.get(p.jti),room=rooms.get(p.room);if(!rec||rec.used||!room||room.exp<Date.now())return deny(ws,'expired_or_replayed');if(room.peers.length>=2||room.peers.some(x=>x.role===p.role))return deny(ws,'room_full_or_role_taken');rec.used=true;st={room:p.room,role:p.role,nome:String(m.nome||'Participante').slice(0,80)};room.peers.push({ws,role:p.role,nome:st.nome});if(room.peers.length===2)room.peers.forEach((x,i)=>{if(x.ws.readyState===1){x.ws.send(JSON.stringify({type:'ready',offerer:x.role==='recrutador'}));x.ws.send(JSON.stringify({type:'peer-info',nome:room.peers[1-i].nome,role:room.peers[1-i].role}))}});else ws.send(JSON.stringify({type:'waiting'}));return}if(!st)return deny(ws,'not_joined');const room=rooms.get(st.room);if(!room||room.exp<Date.now())return deny(ws,'expired');for(const p of room.peers)if(p.ws!==ws&&p.ws.readyState===1)p.ws.send(JSON.stringify(m))});ws.on('close',()=>{if(!st)return;const room=rooms.get(st.room);if(room){room.peers=room.peers.filter(x=>x.ws!==ws);if(!room.peers.length)rooms.delete(st.room)}})});
-server.listen(PORT,()=>console.log('isolated video signaling online'));
+const express=require('express');
+const cors=require('cors');
+const webpush=require('web-push');
+const WebSocket=require('ws');
+const crypto=require('crypto');
+const app=express();
+app.use(cors());
+app.use(express.json({limit:'32kb'}));
+const subs=new Map();
+if(process.env.VAPID_PUBLIC_KEY&&process.env.VAPID_PRIVATE_KEY) webpush.setVapidDetails(process.env.VAPID_SUBJECT||'mailto:teste@vagasio.com.br',process.env.VAPID_PUBLIC_KEY,process.env.VAPID_PRIVATE_KEY);
+app.get('/health',(req,res)=>res.json({ok:true,assinaturas:subs.size,video:true}));
+app.get('/public-key',(req,res)=>res.json({publicKey:process.env.VAPID_PUBLIC_KEY||null}));
+app.post('/subscribe',(req,res)=>{const s=req.body;if(!s?.endpoint||!s?.keys?.p256dh||!s?.keys?.auth)return res.status(400).json({erro:'Assinatura inválida'});subs.set(s.endpoint,s);res.json({ok:true});});
+app.post('/send-test',async(req,res)=>{if(!process.env.VAPID_PUBLIC_KEY||!process.env.VAPID_PRIVATE_KEY)return res.status(503).json({erro:'VAPID não configurado'});const payload=JSON.stringify({title:'VagasIO — teste real',body:'Notificação enviada pelo backend de teste.'});let enviados=0;for(const [endpoint,s] of subs){try{await webpush.sendNotification(s,payload);enviados++}catch(e){if(e.statusCode===404||e.statusCode===410)subs.delete(endpoint)}}res.json({ok:true,enviados});});
+const rooms=new Map();
+const TTL=15*60*1000;
+function newRoom(req){const room='entrevista-'+crypto.randomBytes(4).toString('hex');const item={room,tokens:{recrutador:crypto.randomBytes(24).toString('hex'),candidato:crypto.randomBytes(24).toString('hex')},expiresAt:Date.now()+TTL,ended:false,peers:new Map()};rooms.set(room,item);return item}
+app.post('/create-room',(req,res)=>{const item=newRoom(req);const base='https://sistemarecrutsmento.github.io/vagas-push-teste/video.html';const q=(role,name)=>base+'?room='+encodeURIComponent(item.room)+'&token='+item.tokens[role]+'&role='+role+'&nome='+encodeURIComponent(String(name||role).slice(0,80));res.json({ok:true,room:item.room,recrutador_url:q('recrutador',req.body?.recrutador||'Recrutador'),candidato_url:q('candidato',req.body?.candidato||'Candidato'),expira_em:new Date(item.expiresAt).toISOString()});});
+function send(s,m){if(s&&s.readyState===WebSocket.OPEN)s.send(JSON.stringify(m))}
+function broadcast(item,m,except){for(const s of item.peers.values())if(s!==except)send(s,m)}
+function reject(s,code,reason){send(s,{type:code,reason});setTimeout(()=>{try{s.close(1008,reason)}catch(_){ }},20)}
+const server=app.listen(process.env.PORT||3000,()=>console.log('push/video reconnect test online'));
+const wss=new WebSocket.Server({server});
+wss.on('connection',socket=>{
+ let item=null,role=null,joined=false;
+ socket.on('message',raw=>{
+  let msg;try{msg=JSON.parse(raw)}catch(_){return}
+  if(msg.type==='join'){
+   if(joined||!msg.room||!msg.token)return reject(socket,'unauthorized','join-required');
+   const room=rooms.get(String(msg.room).slice(0,80));const r=String(msg.role||'').toLowerCase();
+   if(!room)return reject(socket,'unauthorized','unknown-room');
+   if(Date.now()>=room.expiresAt){rooms.delete(room.room);return reject(socket,'expired','room-expired')}
+   if(room.ended)return reject(socket,'ended','room-ended');
+   if(!['recrutador','candidato'].includes(r)||msg.token!==room.tokens[r])return reject(socket,'unauthorized','invalid-role-token');
+   if(room.peers.has(r))return reject(socket,'full','role-already-connected');
+   if(room.peers.size>=2)return reject(socket,'full','room-full');
+   item=room;role=r;joined=true;socket.info={nome:String(msg.nome||'Participante').slice(0,80),perfil:r};room.peers.set(r,socket);
+   const other=[...room.peers.entries()].find(([x])=>x!==r);
+   send(socket,{type:'joined',role:r,expiresAt:room.expiresAt});
+   if(other){send(socket,{type:'peer-info',...other[1].info});send(other[1],{type:'peer-info',...socket.info});send(other[1],{type:'ready'});send(socket,{type:'ready'});}
+   else send(socket,{type:'waiting'});
+   return;
+  }
+  if(!joined||!item)return;
+  if(msg.type==='end-call'){
+   if(role!=='recrutador')return reject(socket,'unauthorized','recruiter-only-end-call');
+   if(item.ended)return;
+   item.ended=true;broadcast(item,{type:'call-ended',by:'recrutador'});send(socket,{type:'call-ended',by:'recrutador'});
+   for(const p of item.peers.values())try{p.close(1000,'call-ended')}catch(_){ }
+   item.peers.clear();return;
+  }
+  if(['offer','answer','candidate','chat'].includes(msg.type))broadcast(item,msg,socket);
+ });
+ socket.on('close',()=>{if(!item||!joined)return;if(item.peers.get(role)===socket)item.peers.delete(role);broadcast(item,{type:'peer-left',role});if(item.peers.size===0&&item.ended)rooms.delete(item.room);});
+});
+setInterval(()=>{const now=Date.now();for(const [id,r] of rooms){if(now>=r.expiresAt){broadcast(r,{type:'expired'});for(const p of r.peers.values())try{p.close(1000,'expired')}catch(_){ }rooms.delete(id)}}},30*1000).unref();
